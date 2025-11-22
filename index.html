@@ -1,0 +1,656 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>3D Car Drift Arena — Hybrid Ramps + Top Minimap + HB3</title>
+  <style>
+    html,body { height:100%; margin:0; background:#111; font-family:Inter,Arial,Helvetica,sans-serif; overflow:hidden; }
+    #gameCanvas { display:block; width:100vw; height:100vh; }
+    /* UI */
+    #ui { position:absolute; left:14px; top:14px; z-index:50; color:#fff; background:rgba(0,0,0,0.35); padding:8px 12px; border-radius:8px; font-size:14px; }
+    #driftIndicator { position:absolute; right:14px; top:14px; z-index:50; color:#ff9a33; font-weight:800; font-size:18px; display:none; text-shadow:0 2px 6px rgba(0,0,0,0.6); }
+    #speedometer { position:absolute; right:14px; bottom:14px; z-index:50; width:110px; height:110px; border-radius:50%; background:rgba(0,0,0,0.5); display:flex; align-items:center; justify-content:center; color:#fff; border:2px solid rgba(255,255,255,0.06); }
+    #instructions { position:absolute; left:50%; transform:translateX(-50%); bottom:14px; z-index:50; color:#ddd; background:rgba(0,0,0,0.35); padding:6px 10px; border-radius:8px; font-size:12px; }
+    #minimapHint { position:absolute; left:14px; bottom:14px; z-index:50; color:#ddd; font-size:11px; pointer-events:none; }
+  </style>
+</head>
+<body>
+  <canvas id="gameCanvas"></canvas>
+
+  <div id="ui">
+    <div>Speed: <span id="speed">0</span> km/h</div>
+    <div>Drift Angle: <span id="driftAngle">0</span>°</div>
+    <div>Height: <span id="height">0.00</span> m</div>
+  </div>
+
+  <div id="driftIndicator">DRIFT!</div>
+
+  <div id="speedometer"><div style="text-align:center;"><div id="speedDisplay" style="font-size:20px">0</div><div style="font-size:11px;opacity:0.9">km/h</div></div></div>
+
+  <div id="instructions">WASD / Arrows • Space = HAND-BRAKE (Arcade)</div>
+  <div id="minimapHint">Minimap: Top-down (bottom-left)</div>
+
+  <script src="https://cdn.jsdelivr.net/npm/three@0.152.0/build/three.min.js"></script>
+  <script>
+  (function(){
+    // --- uploaded image path preserved as requested ---
+    const uploadedImagePath = '/mnt/data/74176d45-998a-4e42-897a-07f73c28e168.png';
+    console.log('uploadedImagePath:', uploadedImagePath);
+
+    // Renderer & scene
+    const canvas = document.getElementById('gameCanvas');
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x87CEEB);
+    scene.fog = new THREE.FogExp2(0x87CEEB, 0.0015);
+
+    // Main camera
+    const camera = new THREE.PerspectiveCamera(62, window.innerWidth/window.innerHeight, 0.1, 1000);
+    camera.position.set(0, 8, 16);
+
+    // Lights
+    const hemi = new THREE.HemisphereLight(0xffffff, 0x444444, 0.7);
+    scene.add(hemi);
+    const sun = new THREE.DirectionalLight(0xffffff, 1.0);
+    sun.position.set(50, 80, 50);
+    sun.castShadow = true;
+    sun.shadow.mapSize.width = 2048; sun.shadow.mapSize.height = 2048;
+    scene.add(sun);
+
+    // Ground
+    const ground = new THREE.Mesh(new THREE.PlaneGeometry(400,400), new THREE.MeshLambertMaterial({ color: 0x202020 }));
+    ground.rotation.x = -Math.PI/2;
+    ground.receiveShadow = true;
+    scene.add(ground);
+
+    // Grid
+    const grid = new THREE.GridHelper(200, 40, 0x101010, 0x080808);
+    grid.material.opacity = 0.06; grid.material.transparent = true;
+    scene.add(grid);
+
+    // Obstacles
+    const obstacles = [];
+    const obstacleMeshes = [];
+    (function createObstacles(){
+      const mat = new THREE.MeshLambertMaterial({ color: 0xff4444 });
+      const defs = [
+        { pos: [15, 1, 15], size: [3,2,3] },
+        { pos: [-15,1,-15], size: [3,2,3] },
+        { pos: [20,1,-10], size: [2,3,2] },
+        { pos: [-20,1,10], size: [2,3,2] },
+        { pos: [0,1.5,0], size: [4,3,4] }
+      ];
+      defs.forEach(d => {
+        const m = new THREE.Mesh(new THREE.BoxGeometry(...d.size), mat);
+        m.position.set(...d.pos); m.castShadow = true; m.receiveShadow = true; scene.add(m);
+        obstacles.push({ mesh: m, halfSize: new THREE.Vector3(d.size[0]/2,d.size[1]/2,d.size[2]/2) });
+        obstacleMeshes.push(m);
+      });
+    })();
+
+    // Ramps: Hybrid style (C) tuned constants
+    const ramps = [];
+    const rampMeshes = [];
+    (function createRamps(){
+      const mat = new THREE.MeshLambertMaterial({ color: 0x777777 });
+      const defs = [
+        { pos: [20, 0.05, 18], rotX: -Math.PI/10, rotY: -Math.PI/6, size: [8,0.5,10] },
+        { pos: [-20, 0.05, -18], rotX: -Math.PI/10, rotY: Math.PI/6, size: [8,0.5,10] },
+        // add mild ramp for variety
+        { pos: [8, 0.05, -22], rotX: -Math.PI/12, rotY: Math.PI/10, size: [6,0.5,8] }
+      ];
+      defs.forEach(d => {
+        const m = new THREE.Mesh(new THREE.BoxGeometry(...d.size), mat);
+        m.position.set(...d.pos);
+        m.rotation.set(d.rotX, d.rotY, 0);
+        m.castShadow = true; m.receiveShadow = true;
+        scene.add(m);
+        rampMeshes.push(m);
+        ramps.push({ mesh: m, size: new THREE.Vector3(d.size[0], d.size[1], d.size[2]) });
+      });
+    })();
+
+    // Walls
+    (function createWalls(){
+      const mat = new THREE.MeshLambertMaterial({ color: 0x8B4513 });
+      const arenaSize = 40, wallHeight = 3, thickness = 1;
+      const def = [
+        { pos: [0, wallHeight/2, arenaSize], size: [arenaSize*2, wallHeight, thickness] },
+        { pos: [0, wallHeight/2, -arenaSize], size: [arenaSize*2, wallHeight, thickness] },
+        { pos: [arenaSize, wallHeight/2, 0], size: [thickness, wallHeight, arenaSize*2] },
+        { pos: [-arenaSize, wallHeight/2, 0], size: [thickness, wallHeight, arenaSize*2] }
+      ];
+      def.forEach(w => {
+        const m = new THREE.Mesh(new THREE.BoxGeometry(...w.size), mat);
+        m.position.set(...w.pos); m.castShadow = true; scene.add(m);
+      });
+    })();
+
+    // Car
+    const car = new THREE.Group();
+    const wheels = [];
+    (function makeCar(){
+      const body = new THREE.Mesh(new THREE.BoxGeometry(2,0.8,4), new THREE.MeshPhongMaterial({ color: 0xff0000 }));
+      body.position.y = 0.6; body.castShadow = true; car.add(body);
+      const roof = new THREE.Mesh(new THREE.BoxGeometry(1.6,0.6,2), new THREE.MeshPhongMaterial({ color: 0xcc0000 }));
+      roof.position.set(0,1.05,-0.4); roof.castShadow = true; car.add(roof);
+      const wheelGeo = new THREE.CylinderGeometry(0.38,0.38,0.35,16);
+      const wheelMat = new THREE.MeshPhongMaterial({ color: 0x111111 });
+      const wheelPos = [
+        [-1.15, 0.35, 1.45],
+        [1.15, 0.35, 1.45],
+        [-1.15, 0.35, -1.45],
+        [1.15, 0.35, -1.45]
+      ];
+      wheelPos.forEach(p => {
+        const w = new THREE.Mesh(wheelGeo, wheelMat);
+        w.rotation.z = Math.PI/2; w.position.set(...p); w.castShadow = true; car.add(w); wheels.push(w);
+      });
+      car.position.set(0, 0.02, 0);
+      scene.add(car);
+    })();
+
+    // Physics state
+    const physics = {
+      position: new THREE.Vector3(0,0,0),
+      velocity: new THREE.Vector3(0,0,0),
+      rotation: 0,
+      steering: 0,
+      speed: 0,
+      maxSpeed: 36,
+      acceleration: 16,
+      brakeForce: 28,
+      deceleration: 8,
+      steeringSpeed: 2.6,
+      driftFactor: 0,
+      isDrifting: false,
+      angularVelocity: 0,
+      airborne: false,
+      airVelY: 0,
+      pitchVel: 0,
+      rollVel: 0
+    };
+
+    // Input
+    const keys = {};
+    window.addEventListener('keydown', e => { keys[e.code] = true; if (e.key) keys[e.key.toLowerCase()] = true; }, {passive:true});
+    window.addEventListener('keyup', e => { keys[e.code] = false; if (e.key) keys[e.key.toLowerCase()] = false; }, {passive:true});
+
+    // Helpers
+    function forwardVector(yaw){ return new THREE.Vector3(Math.sin(yaw), 0, Math.cos(yaw)); }
+    function rightVector(yaw){ return new THREE.Vector3(Math.cos(yaw), 0, -Math.sin(yaw)); }
+
+    // Raycaster for ramp/landing detection
+    const downRay = new THREE.Raycaster(); downRay.far = 6;
+
+    // Particle sparks pool (same idea as before)
+    const maxParticles = 700;
+    const pPos = new Float32Array(maxParticles*3);
+    const pCol = new Float32Array(maxParticles*3);
+    const pSize = new Float32Array(maxParticles);
+    const pLife = new Float32Array(maxParticles);
+    const pVel = new Array(maxParticles).fill().map(()=> new THREE.Vector3());
+    const pAlive = new Array(maxParticles).fill(false);
+
+    function makeSprite(){
+      const s = 64; const c = document.createElement('canvas'); c.width = c.height = s; const ctx = c.getContext('2d');
+      const g = ctx.createRadialGradient(s/2,s/2,0,s/2,s/2,s/2);
+      g.addColorStop(0,'rgba(255,255,255,1)'); g.addColorStop(0.15,'rgba(255,230,180,1)');
+      g.addColorStop(0.35,'rgba(255,120,30,0.9)'); g.addColorStop(1,'rgba(0,0,0,0)');
+      ctx.fillStyle = g; ctx.fillRect(0,0,s,s);
+      return new THREE.CanvasTexture(c);
+    }
+    const spriteTex = makeSprite();
+    const partGeo = new THREE.BufferGeometry();
+    partGeo.setAttribute('position', new THREE.BufferAttribute(pPos, 3));
+    partGeo.setAttribute('color', new THREE.BufferAttribute(pCol, 3));
+    partGeo.setAttribute('size', new THREE.BufferAttribute(pSize, 1));
+    const partMat = new THREE.PointsMaterial({ size:0.18, map: spriteTex, vertexColors:true, transparent:true, blending:THREE.AdditiveBlending, depthWrite:false });
+    const particles = new THREE.Points(partGeo, partMat);
+    scene.add(particles);
+
+    function emitParticle(pos, velVec, life, color, size=0.16){
+      for (let i=0;i<maxParticles;i++){
+        if (!pAlive[i]){
+          pAlive[i] = true;
+          pPos[i*3] = pos.x; pPos[i*3+1] = pos.y; pPos[i*3+2] = pos.z;
+          pCol[i*3] = color.r; pCol[i*3+1] = color.g; pCol[i*3+2] = color.b;
+          pSize[i] = size; pLife[i] = life; pVel[i].copy(velVec);
+          partGeo.attributes.position.needsUpdate = true;
+          partGeo.attributes.color.needsUpdate = true;
+          partGeo.attributes.size.needsUpdate = true;
+          return;
+        }
+      }
+    }
+
+    function emitDriftSparks(){
+      const rearLeft = new THREE.Vector3(-1.15,0,-1.45);
+      const rearRight = new THREE.Vector3(1.15,0,-1.45);
+      [rearLeft,rearRight].forEach(local => {
+        const w = local.clone();
+        const c = Math.cos(physics.rotation), s = Math.sin(physics.rotation);
+        const x = w.x*c - w.z*s, z = w.x*s + w.z*c;
+        w.x = x + physics.position.x; w.z = z + physics.position.z; w.y = 0.25 + Math.random()*0.12;
+        const base = forwardVector(physics.rotation).clone().multiplyScalar(-0.6 - Math.random()*0.6);
+        const jitter = new THREE.Vector3((Math.random()-0.5)*1.2, Math.random()*0.6, (Math.random()-0.5)*1.2);
+        const v = base.add(jitter).multiplyScalar(1 + Math.abs(physics.speed)/16);
+        const col = new THREE.Color(0xffb86b).lerp(new THREE.Color(0xff3300), Math.random()*0.7);
+        const cnt = 4 + Math.floor(Math.random()*5);
+        for (let i=0;i<cnt;i++){
+          const v2 = v.clone().add(new THREE.Vector3((Math.random()-0.5)*0.8, Math.random()*0.6, (Math.random()-0.5)*0.8));
+          emitParticle(w.clone(), v2, 0.45 + Math.random()*0.35, col, 0.12 + Math.random()*0.18);
+        }
+      });
+    }
+
+    function emitCollisionBurst(pos){
+      const c1 = new THREE.Color(0xffffff), c2 = new THREE.Color(0xffcf66);
+      const n = 40 + Math.floor(Math.random()*40);
+      for (let i=0;i<n;i++){
+        const dir = new THREE.Vector3((Math.random()-0.5), Math.random()*0.8, (Math.random()-0.5)).normalize();
+        const s = 3 + Math.random()*6; const v = dir.multiplyScalar(s);
+        const col = c1.clone().lerp(c2, Math.random()); emitParticle(pos.clone(), v, 0.5 + Math.random()*0.6, col, 0.16 + Math.random()*0.25);
+      }
+    }
+
+    function emitLandingBurst(pos, intensity=1.0){
+      const c1 = new THREE.Color(0xffa86b), c2 = new THREE.Color(0xffffff);
+      const n = Math.min(80, Math.floor(10 + intensity*50));
+      for (let i=0;i<n;i++){
+        const dir = new THREE.Vector3((Math.random()-0.5), Math.random()*0.9, (Math.random()-0.5)).normalize();
+        const s = 2 + Math.random()*6*intensity; emitParticle(pos.clone(), dir.multiplyScalar(s), 0.5 + Math.random()*0.6, c1.clone().lerp(c2, Math.random()), 0.12 + Math.random()*0.2);
+      }
+    }
+
+    function updateParticles(dt){
+      let upd=false;
+      for (let i=0;i<maxParticles;i++){
+        if (!pAlive[i]) continue;
+        pLife[i] -= dt;
+        if (pLife[i] <= 0){ pAlive[i]=false; pPos[i*3]=pPos[i*3+1]=pPos[i*3+2]=0; pCol[i*3]=pCol[i*3+1]=pCol[i*3+2]=0; pSize[i]=0; upd=true; continue; }
+        pVel[i].y -= 9.8 * dt * 0.3;
+        pVel[i].multiplyScalar(1 - Math.min(0.95, dt*2.0));
+        pPos[i*3] += pVel[i].x * dt; pPos[i*3+1] += pVel[i].y * dt; pPos[i*3+2] += pVel[i].z * dt;
+        pSize[i] *= 0.995; pCol[i*3] *= 0.998; pCol[i*3+1] *= 0.998; pCol[i*3+2] *= 0.998;
+        upd=true;
+      }
+      if (upd){ partGeo.attributes.position.needsUpdate=true; partGeo.attributes.color.needsUpdate=true; partGeo.attributes.size.needsUpdate=true; }
+    }
+
+    function boxIntersectsPoint(center, half, point){
+      return Math.abs(point.x - center.x) <= half.x + 0.9 &&
+             Math.abs(point.y - center.y) <= half.y + 0.9 &&
+             Math.abs(point.z - center.z) <= half.z + 0.9;
+    }
+
+    // Ramp launch attempt — hybrid tuning (C)
+    function attemptRampLaunch(){
+      const frontOffset = 1.9;
+      const frontWorld = physics.position.clone().add(forwardVector(physics.rotation).multiplyScalar(frontOffset));
+      const rayOrigin = frontWorld.clone(); rayOrigin.y += 1.2;
+      downRay.set(rayOrigin, new THREE.Vector3(0, -1, 0));
+      const hits = downRay.intersectObjects(rampMeshes, true);
+      if (hits.length === 0) return;
+      const hit = hits[0];
+      const rampNormal = hit.face ? hit.face.normal.clone().applyMatrix3(new THREE.Matrix3().getNormalMatrix(hit.object.matrixWorld)).normalize() : new THREE.Vector3(0,1,0);
+      if (rampNormal.y <= 0.25) return;
+      const verticalDist = rayOrigin.y - hit.point.y;
+      const approachDot = forwardVector(physics.rotation).dot(rampNormal.clone().negate());
+      // Hybrid: require decent speed + approach angle + front actually on ramp
+      if (verticalDist < 1.0 && approachDot > 0.12 && Math.abs(physics.speed) > 8){
+        // compute along-ramp and normal components
+        const forwardMag = physics.speed;
+        const forwardOnPlane = forwardVector(physics.rotation).clone().projectOnPlane(rampNormal).normalize();
+        const along = forwardOnPlane.clone().multiplyScalar(forwardMag * 0.75);
+        // normalPush scaled by ramp steepness but capped for realism
+        const steepnessFactor = Math.max(0.0, 1 - rampNormal.y);
+        const normalPush = rampNormal.clone().multiplyScalar(Math.min(10, forwardMag * (0.35 + steepnessFactor * 0.9)));
+        const launchVel = along.clone().add(normalPush.clone().setY(0));
+        // vertical component
+        const airVelY = Math.max(2.0, Math.min(10, normalPush.y + Math.abs(physics.speed) * 0.06));
+        // Apply airborne
+        physics.airborne = true;
+        physics.airVelY = airVelY;
+        physics.velocity.copy(launchVel);
+        physics.speed = physics.velocity.length();
+        // lift slightly above ramp to avoid immediate re-intersection
+        physics.position.y = hit.point.y + 0.06;
+        physics.pitchVel = -0.6 * Math.sign(physics.speed) * (0.6 + Math.random()*0.4);
+        physics.rollVel = (Math.random() - 0.5) * 0.5;
+        physics.position.add(forwardVector(physics.rotation).multiplyScalar(0.12));
+        // small launch sparks
+        emitDriftSparks();
+      }
+    }
+
+    // HAND-BRAKE (HB3): Arcade style behavior
+    // On press: lock rear (increase lateral), strong angular impulse
+    let handbrakeHeld = false;
+    function handleHandbrakeStart(){
+      handbrakeHeld = true;
+      // immediate strong driftFactor increase
+      physics.driftFactor = Math.min(1.2, physics.driftFactor + 0.9);
+      physics.isDrifting = true;
+      // give an angular impulse based on steering and current speed to start a big drift
+      const impulse = 1.8 * Math.sign(physics.steering || 1) * (Math.abs(physics.speed)/Math.max(1, physics.maxSpeed));
+      physics.angularVelocity += impulse * 0.8;
+      // stronger lateral slip
+      // add lateral velocity component
+      const lateral = rightVector(physics.rotation).clone().multiplyScalar(physics.speed * 0.9 * (Math.random()*0.6 + 0.7));
+      physics.velocity.add(lateral);
+      // sparks & smoke feel
+      emitDriftSparks();
+    }
+    function handleHandbrakeEnd(){
+      handbrakeHeld = false;
+      // keep some residual drift but decay rapidly
+      physics.driftFactor = Math.min(1.0, physics.driftFactor * 0.7);
+    }
+
+    // Input bindings for Space special handling
+    window.addEventListener('keydown', e => {
+      if (e.code === 'Space' || e.key === ' ') {
+        if (!handbrakeHeld) handleHandbrakeStart();
+      }
+    }, {passive:true});
+    window.addEventListener('keyup', e => {
+      if (e.code === 'Space' || e.key === ' ') {
+        handleHandbrakeEnd();
+      }
+    }, {passive:true});
+
+    // Other physics, camera, UI
+    const clock = new THREE.Clock();
+    const chase = { offsetZ: 12, offsetY: 7, lookAtY: 1.5 };
+    let cameraShake = 0;
+    function applyCameraShake(val){ cameraShake = Math.max(cameraShake, val); }
+
+    // Minimap: orthographic top-down camera; no frame — we'll render into bottom-left viewport directly
+    const miniSize = 40;
+    const miniAspect = 240/160;
+    const miniCam = new THREE.OrthographicCamera(-miniSize*miniAspect, miniSize*miniAspect, miniSize, -miniSize, 0.1, 200);
+    miniCam.position.set(0, 90, 0);
+    miniCam.up.set(0,0,-1);
+    miniCam.lookAt(new THREE.Vector3(0,0,0));
+
+    // Update physics per frame
+    function updatePhysics(dt){
+      // Airborne behavior
+      if (physics.airborne){
+        // limited steering while airborne
+        const steerEffect = 0.25;
+        const steerInput = ((keys['a']||keys['KeyA']||keys['ArrowLeft'])? -1:0) + ((keys['d']||keys['KeyD']||keys['ArrowRight'])? 1:0);
+        physics.steering += (steerInput - physics.steering) * Math.min(1, dt * 6);
+        physics.angularVelocity += (-physics.steering * physics.steeringSpeed * steerEffect * dt * 1.6);
+        // gravity
+        physics.airVelY -= 9.8 * dt;
+        physics.position.y += physics.airVelY * dt;
+        // carry forward motion
+        const fwd = forwardVector(physics.rotation);
+        physics.velocity.copy(fwd.clone().multiplyScalar(physics.speed * 0.995));
+        physics.position.add(physics.velocity.clone().multiplyScalar(dt));
+        // pitch/roll visuals
+        physics.pitchVel *= 0.994; physics.rollVel *= 0.994;
+        car.rotation.x += physics.pitchVel * dt;
+        car.rotation.z += physics.rollVel * dt;
+        // landing detection
+        const rayOrigin = physics.position.clone(); rayOrigin.y += 1.6;
+        downRay.set(rayOrigin, new THREE.Vector3(0,-1,0));
+        const candidates = [ground, ...rampMeshes, ...obstacleMeshes];
+        const hits = downRay.intersectObjects(candidates, true);
+        if (hits.length > 0){
+          const hit = hits[0];
+          if (physics.position.y - hit.point.y <= 0.28){
+            const impact = Math.abs(physics.airVelY);
+            physics.position.y = hit.point.y;
+            physics.airborne = false;
+            physics.airVelY = 0;
+            // landing reduces speed scaled by impact
+            physics.speed *= Math.max(0.5, 1 - impact * 0.08);
+            emitLandingBurst(physics.position.clone(), Math.min(1.6, impact/5));
+            applyCameraShake(Math.min(1.2, impact/12));
+            // restore visual rotation
+            car.rotation.x = 0; car.rotation.z = 0;
+          }
+        }
+        return;
+      }
+
+      // Ground controls
+      let steerInput = 0;
+      if (keys['a'] || keys['KeyA'] || keys['ArrowLeft']) steerInput -= 1;
+      if (keys['d'] || keys['KeyD'] || keys['ArrowRight']) steerInput += 1;
+      const steerTarget = steerInput;
+      physics.steering += (steerTarget - physics.steering) * Math.min(1, dt * 10);
+
+      const throttle = (keys['w'] || keys['KeyW'] || keys['ArrowUp']) ? 1 : 0;
+      const brake = (keys['s'] || keys['KeyS'] || keys['ArrowDown']) ? 1 : 0;
+
+      if (throttle) physics.speed += physics.acceleration * throttle * dt;
+      else if (brake) physics.speed -= physics.brakeForce * dt;
+      else {
+        const drag = physics.deceleration * dt;
+        if (physics.speed > 0) physics.speed = Math.max(0, physics.speed - drag);
+        else physics.speed = Math.min(0, physics.speed + drag);
+      }
+      physics.speed = Math.max(-physics.maxSpeed*0.5, Math.min(physics.maxSpeed, physics.speed));
+
+      // If handbrake is held we already set driftFactor aggressively; else decay
+      if (!handbrakeHeld){
+        physics.driftFactor = Math.max(0, physics.driftFactor - dt * 1.6);
+        physics.isDrifting = physics.driftFactor > 0.08;
+      } else {
+        physics.isDrifting = true; // HB3 forces drifting mode
+      }
+
+      // Steering & turning: corrected sign (right arrow -> right)
+      const speedFactor = Math.abs(physics.speed) / physics.maxSpeed;
+      const baseTurn = -physics.steering * physics.steeringSpeed * (0.8 + speedFactor * 1.2);
+
+      if (physics.isDrifting){
+        // more aggressive turning when HB3 active
+        physics.angularVelocity += baseTurn * (1 + physics.driftFactor * 2.4) * dt * 52;
+        // slight angular damping
+        physics.angularVelocity *= (1 - Math.min(0.9, 0.7 * dt));
+      } else {
+        physics.angularVelocity = baseTurn * dt * 60;
+      }
+
+      // Compose velocity: forward + lateral component from drift
+      const fwd = forwardVector(physics.rotation);
+      const rgt = rightVector(physics.rotation);
+      const forwardVel = fwd.clone().multiplyScalar(physics.speed);
+      let lateralVel = new THREE.Vector3(0,0,0);
+      if (physics.isDrifting){
+        const lateralStrength = (handbrakeHeld ? 1.2 : 0.6);
+        lateralVel = rgt.clone().multiplyScalar(physics.speed * physics.driftFactor * lateralStrength * (physics.speed >= 0 ? 1 : -1));
+      }
+      physics.velocity.copy(forwardVel).add(lateralVel);
+
+      // Integrate horizontal movement & rotation
+      physics.position.add(physics.velocity.clone().multiplyScalar(dt));
+      physics.rotation += physics.angularVelocity * dt;
+
+      // drift sparks occasionally
+      if (physics.isDrifting && Math.abs(physics.speed) > 8 && Math.random() < 0.5) emitDriftSparks();
+
+      // Attempt ramp launch if front over ramp
+      attemptRampLaunch();
+
+      // Boundaries and obstacles
+      const boundary = 38;
+      let hitWall = false;
+      if (physics.position.x > boundary){ physics.position.x = boundary; physics.speed *= 0.35; hitWall = true; }
+      else if (physics.position.x < -boundary){ physics.position.x = -boundary; physics.speed *= 0.35; hitWall = true; }
+      if (physics.position.z > boundary){ physics.position.z = boundary; physics.speed *= 0.35; hitWall = true; }
+      else if (physics.position.z < -boundary){ physics.position.z = -boundary; physics.speed *= 0.35; hitWall = true; }
+      if (hitWall && Math.abs(physics.speed) > 6) emitCollisionBurst(physics.position.clone());
+
+      for (let i=0;i<obstacles.length;i++){
+        const ob = obstacles[i];
+        if (boxIntersectsPoint(ob.mesh.position, ob.halfSize, physics.position)){
+          const push = forwardVector(physics.rotation).clone().multiplyScalar(-1.6);
+          physics.position.add(push);
+          physics.speed *= 0.35;
+          emitCollisionBurst(physics.position.clone());
+        }
+      }
+
+      // Place car Y by raycast (ground/ramps/obstacles)
+      const rayOrigin = physics.position.clone(); rayOrigin.y += 1.4;
+      downRay.set(rayOrigin, new THREE.Vector3(0,-1,0));
+      const candidates = [ground, ...rampMeshes, ...obstacleMeshes];
+      const hits = downRay.intersectObjects(candidates, true);
+      if (hits.length > 0) physics.position.y = hits[0].point.y + 0.01;
+      else physics.position.y = 0;
+
+      // Update car model & wheels
+      car.position.copy(physics.position);
+      car.rotation.y = physics.rotation;
+      // smooth pitch/roll back to zero when grounded
+      car.rotation.x += (0 - car.rotation.x) * Math.min(1, dt * 4);
+      car.rotation.z += (0 - car.rotation.z) * Math.min(1, dt * 4);
+
+      const spin = physics.speed * 3 * dt;
+      wheels.forEach((w, idx) => {
+        w.rotation.x += spin;
+        if (idx === 0 || idx === 1){
+          const maxSteer = 0.5;
+          const sv = physics.steering * maxSteer * (physics.speed >= 0 ? 1 : -1);
+          w.rotation.y += (sv - w.rotation.y) * 0.3;
+        }
+      });
+    }
+
+    // Camera update
+    function updateCamera(dt){
+      const fwd = forwardVector(physics.rotation);
+      const desired = physics.position.clone().add(fwd.clone().multiplyScalar(-chase.offsetZ));
+      desired.y += chase.offsetY;
+      camera.position.lerp(desired, Math.min(1, dt * 4));
+      if (cameraShake > 0){
+        const s = cameraShake * 0.6;
+        camera.position.x += (Math.random()*2 - 1) * s;
+        camera.position.y += (Math.random()*2 - 1) * s * 0.4;
+        camera.position.z += (Math.random()*2 - 1) * s * 0.4;
+        cameraShake = Math.max(0, cameraShake - dt * 2.2);
+      }
+      const look = physics.position.clone(); look.y += chase.lookAtY;
+      camera.lookAt(look);
+    }
+
+    // UI
+    const speedEl = document.getElementById('speed');
+    const speedDisplay = document.getElementById('speedDisplay');
+    const driftAngleEl = document.getElementById('driftAngle');
+    const heightEl = document.getElementById('height');
+    const driftIndicatorEl = document.getElementById('driftIndicator');
+
+    function updateUI(){
+      const kmh = Math.round(Math.abs(physics.speed) * 3.6);
+      speedEl.textContent = kmh; speedDisplay.textContent = kmh;
+      heightEl.textContent = physics.position.y.toFixed(2);
+      const lateral = physics.velocity.clone().dot(rightVector(physics.rotation));
+      const forward = physics.velocity.clone().dot(forwardVector(physics.rotation));
+      const slipAngle = Math.atan2(Math.abs(lateral), Math.max(0.0001, Math.abs(forward))) * (180/Math.PI);
+      driftAngleEl.textContent = Math.round(slipAngle);
+      driftIndicatorEl.style.display = physics.isDrifting && slipAngle > 6 ? 'block' : 'none';
+    }
+
+    // Minimap render: no container, draw into bottom-left viewport with transparent background
+    function renderMiniMap(){
+      // choose minimap size in CSS pixels
+      const cssW = 240, cssH = 160;
+      const DPR = Math.max(1, window.devicePixelRatio || 1);
+      const w = Math.floor(cssW * DPR), h = Math.floor(cssH * DPR);
+      const x = Math.floor(8 * DPR); // left padding
+      const y = Math.floor(8 * DPR); // from bottom
+
+      // miniCam follows car
+      miniCam.position.set(physics.position.x, 90, physics.position.z);
+      miniCam.lookAt(new THREE.Vector3(physics.position.x, 0, physics.position.z));
+      // keep up vector so +Z points up on minimap
+      miniCam.up.set(0,0,-1); miniCam.updateProjectionMatrix();
+
+      // enable scissor & viewport
+      renderer.clearDepth();
+      renderer.setScissorTest(true);
+      // WebGL origin bottom-left
+      const canvasH = renderer.domElement.height;
+      renderer.setViewport(x, canvasH - y - h, w, h);
+      renderer.setScissor(x, canvasH - y - h, w, h);
+
+      // dark translucent background for visibility (draw a black rect)
+      // We'll clear color to semi-transparent black and clear color buffer (only for minimap region)
+      const prevClearAlpha = renderer.getContext().getParameter(renderer.getContext().COLOR_CLEAR_VALUE);
+      renderer.setClearColor(0x000000, 0.35);
+      renderer.clearColor();
+
+      // render scene from miniCam
+      renderer.render(scene, miniCam);
+
+      // restore
+      renderer.setScissorTest(false);
+      renderer.setViewport(0, 0, renderer.domElement.width, renderer.domElement.height);
+      renderer.setClearColor(scene.background);
+    }
+
+    // Resize handler
+    window.addEventListener('resize', ()=> {
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+    });
+
+    // Main loop
+    function animate(){
+      requestAnimationFrame(animate);
+      const dt = Math.min(0.05, clock.getDelta());
+      updatePhysics(dt);
+      updateCamera(dt);
+      updateParticles(dt);
+      updateUI();
+      // render main scene
+      renderer.render(scene, camera);
+      // render minimap overlay (no frame)
+      renderMiniMap();
+    }
+
+    // Particles update function (kept here)
+    function updateParticles(dt){
+      updateParticles._impl ? updateParticles._impl(dt) : (updateParticles._impl = function(dt){
+        let upd=false;
+        for (let i=0;i<maxParticles;i++){
+          if (!pAlive[i]) continue;
+          pLife[i] -= dt;
+          if (pLife[i] <= 0){ pAlive[i]=false; pPos[i*3]=pPos[i*3+1]=pPos[i*3+2]=0; pCol[i*3]=pCol[i*3+1]=pCol[i*3+2]=0; pSize[i]=0; upd=true; continue; }
+          pVel[i].y -= 9.8 * dt * 0.3;
+          pVel[i].multiplyScalar(1 - Math.min(0.95, dt*2.0));
+          pPos[i*3] += pVel[i].x * dt; pPos[i*3+1] += pVel[i].y * dt; pPos[i*3+2] += pVel[i].z * dt;
+          pSize[i] *= 0.995;
+          pCol[i*3] *= 0.998; pCol[i*3+1] *= 0.998; pCol[i*3+2] *= 0.998;
+          upd=true;
+        }
+        if (upd){ partGeo.attributes.position.needsUpdate=true; partGeo.attributes.color.needsUpdate=true; partGeo.attributes.size.needsUpdate=true; }
+      }, updateParticles._impl(dt));
+    }
+
+    // Start animation
+    animate();
+
+    // small convenience: expose physics for debugging
+    window.__carPhysics = physics;
+    window.__emitDriftSparks = emitDriftSparks;
+    window.__emitCollisionBurst = emitCollisionBurst;
+    window.__emitLandingBurst = emitLandingBurst;
+  })();
+  </script>
+</body>
+</html>
